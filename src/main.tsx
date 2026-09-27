@@ -5,6 +5,7 @@ import {
   Pause, Play, UploadSimple,
 } from '@phosphor-icons/react';
 import * as THREE from 'three';
+import { Analytics } from '@vercel/analytics/react';
 import { FoldPhone } from './phone';
 import './style.css';
 
@@ -214,6 +215,7 @@ function App() {
         <div className="feedback" role="status" aria-live="polite">{message ? <><Check size={15} weight="bold" /> {message}</> : <>支持 PNG、JPG、WebP · 图片仅在你的浏览器中处理 · GIF 包含完整开合循环</>}</div>
       </main>
       <footer><span>FOLD STUDIO / INTERACTIVE STUDY</span><span>灵感来自折叠屏形态 · 非 Apple 官方网站</span></footer>
+      <Analytics />
     </div>
   );
 }
