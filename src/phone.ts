@@ -27,8 +27,15 @@ function roundedRect(width: number, height: number, radius: number, edge: 'left'
   return shape;
 }
 
+function frameShape(width: number, height: number, radius: number, side: 'left' | 'right') {
+  const frame = roundedRect(width, height, radius, side);
+  const opening = roundedRect(width - .19, height - .19, radius - .095, side);
+  frame.holes.push(new THREE.Path(opening.getPoints(16).reverse()));
+  return frame;
+}
+
 function screenGeometry(width: number, height: number, radius: number, side: 'left' | 'right' | 'cover') {
-  const geometry = new THREE.ShapeGeometry(roundedRect(width, height, radius, side === 'cover' ? 'all' : side), 16);
+  const geometry = new THREE.ShapeGeometry(roundedRect(width, height, radius, side === 'cover' ? 'left' : side), 16);
   const position = geometry.getAttribute('position');
   const uvs = geometry.getAttribute('uv');
   // A portrait cover displays a centered crop of the landscape wallpaper.
@@ -43,6 +50,81 @@ function screenGeometry(width: number, height: number, radius: number, side: 'le
   return geometry;
 }
 
+// The left leaf is glass in front of a stationary image plane. Sample the
+// wallpaper where the camera ray through each glass pixel meets that plane,
+// instead of carrying the image's UVs around with the rotating leaf.
+function projectedWallpaperMaterial(
+  sharp: THREE.CanvasTexture,
+  soft: THREE.CanvasTexture,
+  blurred: THREE.CanvasTexture,
+  outside = false,
+) {
+  return new THREE.ShaderMaterial({
+    uniforms: {
+      sharpMap: { value: sharp },
+      softMap: { value: soft },
+      blurredMap: { value: blurred },
+      fold: { value: 0 },
+      coverAmount: { value: 0 },
+      wallpaperOffset: { value: 0 },
+    },
+    vertexShader: `
+      varying vec3 vWorldPosition;
+      varying float vGlassX;
+      varying vec2 vCoverUv;
+      void main() {
+        vec4 worldPosition = modelMatrix * vec4(position, 1.0);
+        vWorldPosition = worldPosition.xyz;
+        vGlassX = position.x / ${SCREEN_WIDTH} + 0.5;
+        vCoverUv = uv;
+        gl_Position = projectionMatrix * viewMatrix * worldPosition;
+      }
+    `,
+    fragmentShader: `
+      uniform sampler2D sharpMap;
+      uniform sampler2D softMap;
+      uniform sampler2D blurredMap;
+      uniform float fold;
+      uniform float coverAmount;
+      uniform float wallpaperOffset;
+      varying vec3 vWorldPosition;
+      varying float vGlassX;
+      varying vec2 vCoverUv;
+      void main() {
+        // The image stays in the right display's plane. Only the silhouette
+        // and the optical treatment belong to the moving glass.
+        float rayScale = (cameraPosition.z - 0.074) / (cameraPosition.z - vWorldPosition.z);
+        vec3 imagePoint = cameraPosition + (vWorldPosition - cameraPosition) * rayScale;
+        vec2 uv = vec2(0.5 + (imagePoint.x - wallpaperOffset) / ${2 * SCREEN_WIDTH},
+                       0.5 + imagePoint.y / ${SCREEN_HEIGHT});
+        // The wallpaper ends at a fixed rectangle. Outside it the glass is
+        // black; only the boundary is defocused so there is no horizontal cut
+        // between the image and the dark wedges above and below it.
+        float overshoot = max(max(-uv.x, uv.x - 1.0), max(-uv.y, uv.y - 1.0));
+        float feather = ${outside ? '0.075' : '0.003 + 0.065 * smoothstep(0.0, 0.28, fold)'};
+        float imageWeight = smoothstep(-feather * 0.45, feather, -overshoot);
+        float outerEdge = clamp(1.0 - vGlassX, 0.0, 1.0);
+        float haze = ${outside ? '0.38 * pow(outerEdge, 0.8)' : 'min(1.0, fold * 4.4) * pow(outerEdge, 0.8)'};
+        vec3 image = texture2D(sharpMap, uv).rgb;
+        image = mix(image, texture2D(softMap, uv).rgb, haze * 0.8);
+        image = mix(image, texture2D(blurredMap, uv).rgb, pow(haze, 1.5) * 0.85);
+        float shadow = ${outside ? '0.24 * pow(outerEdge, 1.35)' : 'min(1.0, fold * 5.0) * (0.02 + 0.95 * pow(outerEdge, 1.35))'};
+        image *= 1.0 - shadow;
+        image = mix(vec3(0.002, 0.003, 0.005), image, imageWeight);
+        ${outside ? `// At the closed detent the outside display turns on with its own
+        // centered portrait crop, replacing the view through the pane.
+        image = mix(image, texture2D(sharpMap, vCoverUv).rgb, coverAmount);` : ''}
+        gl_FragColor = vec4(image, 1.0);
+        #include <colorspace_fragment>
+      }
+    `,
+    transparent: true,
+    depthWrite: false,
+    side: THREE.FrontSide,
+    toneMapped: false,
+  });
+}
+
 function wallpaperCanvas() {
   const canvas = document.createElement('canvas');
   canvas.width = WALLPAPER_WIDTH;
@@ -51,7 +133,7 @@ function wallpaperCanvas() {
 }
 
 function overlayGeometry(width: number, height: number, radius: number, side: 'left' | 'right' | 'cover') {
-  const geometry = new THREE.ShapeGeometry(roundedRect(width, height, radius, side === 'cover' ? 'all' : side), 16);
+  const geometry = new THREE.ShapeGeometry(roundedRect(width, height, radius, side === 'cover' ? 'left' : side), 16);
   const position = geometry.getAttribute('position');
   const uvs = geometry.getAttribute('uv');
   for (let i = 0; i < position.count; i++) {
@@ -161,20 +243,19 @@ export class FoldPhone {
   readonly renderer: THREE.WebGLRenderer;
   private readonly leftPivot = new THREE.Group();
   private readonly model = new THREE.Group();
+  private innerCamera?: THREE.Mesh;
   private readonly wallpaper = wallpaperCanvas();
   private readonly blurredWallpaper = wallpaperCanvas();
   private readonly softlyBlurredWallpaper = wallpaperCanvas();
   private readonly texture: THREE.CanvasTexture;
   private readonly blurredTexture: THREE.CanvasTexture;
   private readonly softBlurTexture: THREE.CanvasTexture;
-  private readonly leftBlurMaterial: THREE.MeshBasicMaterial;
-  private readonly leftSoftBlurMaterial: THREE.MeshBasicMaterial;
+  private readonly leftImageMaterial: THREE.ShaderMaterial;
+  private readonly coverGlassMaterial: THREE.ShaderMaterial;
   private readonly rightShadeMaterial: THREE.MeshBasicMaterial;
   private readonly rightVeilMaterial: THREE.MeshBasicMaterial;
   private readonly glassReflectionMaterial: THREE.MeshBasicMaterial;
   private readonly reflectionTexture = glassReflectionTexture();
-  private readonly coverBlurMaterial: THREE.MeshBasicMaterial;
-  private readonly coverSharpMaterial: THREE.MeshBasicMaterial;
   private readonly bridgeMaterial: THREE.MeshBasicMaterial;
   private readonly rightShadeTexture = rearScreenShadowTexture();
   private readonly observer: ResizeObserver;
@@ -203,13 +284,11 @@ export class FoldPhone {
     this.softBlurTexture.colorSpace = THREE.SRGBColorSpace;
     this.texture.anisotropy = Math.min(this.renderer.capabilities.getMaxAnisotropy(), 8);
     this.imageMaterial = new THREE.MeshBasicMaterial({ map: this.texture, side: THREE.DoubleSide, toneMapped: false });
-    this.leftBlurMaterial = new THREE.MeshBasicMaterial({ map: this.blurredTexture, transparent: true, opacity: 0, depthWrite: false, toneMapped: false, side: THREE.DoubleSide });
-    this.leftSoftBlurMaterial = new THREE.MeshBasicMaterial({ map: this.softBlurTexture, transparent: true, opacity: 0, depthWrite: false, toneMapped: false, side: THREE.DoubleSide });
+    this.leftImageMaterial = projectedWallpaperMaterial(this.texture, this.softBlurTexture, this.blurredTexture);
+    this.coverGlassMaterial = projectedWallpaperMaterial(this.texture, this.softBlurTexture, this.blurredTexture, true);
     this.rightShadeMaterial = new THREE.MeshBasicMaterial({ map: this.rightShadeTexture, transparent: true, opacity: 0, depthWrite: false, toneMapped: false, side: THREE.DoubleSide });
     this.rightVeilMaterial = new THREE.MeshBasicMaterial({ color: '#090c12', transparent: true, opacity: 0, depthWrite: false, side: THREE.DoubleSide });
     this.glassReflectionMaterial = new THREE.MeshBasicMaterial({ map: this.reflectionTexture, transparent: true, opacity: 0, depthWrite: false, toneMapped: false, side: THREE.DoubleSide });
-    this.coverBlurMaterial = new THREE.MeshBasicMaterial({ map: this.blurredTexture, side: THREE.DoubleSide, toneMapped: false });
-    this.coverSharpMaterial = new THREE.MeshBasicMaterial({ map: this.texture, transparent: true, opacity: 0, depthWrite: false, side: THREE.DoubleSide, toneMapped: false });
     this.bridgeMaterial = new THREE.MeshBasicMaterial({ map: this.texture, transparent: true, opacity: 1, depthWrite: false, toneMapped: false, side: THREE.DoubleSide });
 
     this.scene.add(new THREE.AmbientLight('#ffffff', 2.7));
@@ -249,29 +328,24 @@ export class FoldPhone {
 
     const panel = (side: 'left' | 'right') => {
       const group = new THREE.Group();
-      const shell = new THREE.Mesh(new THREE.ExtrudeGeometry(roundedRect(WIDTH, HEIGHT, RADIUS, side), {
+      const shell = new THREE.Mesh(new THREE.ExtrudeGeometry(side === 'left' ? frameShape(WIDTH, HEIGHT, RADIUS, side) : roundedRect(WIDTH, HEIGHT, RADIUS, side), {
         depth: .115, bevelEnabled: true, bevelThickness: .025, bevelSize: .025, bevelSegments: 3, curveSegments: 16,
       }), metal);
       shell.position.z = -.075;
       group.add(shell);
 
-      const face = new THREE.Mesh(new THREE.ShapeGeometry(roundedRect(WIDTH - .085, HEIGHT - .085, RADIUS - .04, side), 16), blackGlass);
+      const faceShape = side === 'left' ? frameShape(WIDTH - .085, HEIGHT - .085, RADIUS - .04, side) : roundedRect(WIDTH - .085, HEIGHT - .085, RADIUS - .04, side);
+      const face = new THREE.Mesh(new THREE.ShapeGeometry(faceShape, 16), blackGlass);
       face.position.z = .068;
       group.add(face);
       // Extend each image to the hinge. Both textures sample adjacent halves of
       // the same source image, so they meet without a black bezel in the middle.
       const screenX = side === 'left' ? .0525 : -.0525;
-      const display = new THREE.Mesh(screenGeometry(SCREEN_WIDTH, SCREEN_HEIGHT, SCREEN_RADIUS, side), this.imageMaterial);
+      const display = new THREE.Mesh(screenGeometry(SCREEN_WIDTH, SCREEN_HEIGHT, SCREEN_RADIUS, side), side === 'left' ? this.leftImageMaterial : this.imageMaterial);
       display.position.set(screenX, 0, .074);
       group.add(display);
 
       if (side === 'left') {
-        const softlyBlurred = new THREE.Mesh(screenGeometry(SCREEN_WIDTH, SCREEN_HEIGHT, SCREEN_RADIUS, side), this.leftSoftBlurMaterial);
-        softlyBlurred.position.set(screenX, 0, .077);
-        group.add(softlyBlurred);
-        const blurred = new THREE.Mesh(screenGeometry(SCREEN_WIDTH, SCREEN_HEIGHT, SCREEN_RADIUS, side), this.leftBlurMaterial);
-        blurred.position.set(screenX, 0, .080);
-        group.add(blurred);
         const reflection = new THREE.Mesh(overlayGeometry(SCREEN_WIDTH, SCREEN_HEIGHT, SCREEN_RADIUS, side), this.glassReflectionMaterial);
         reflection.position.set(screenX, 0, .087);
         group.add(reflection);
@@ -284,25 +358,23 @@ export class FoldPhone {
         group.add(veil);
       }
 
-      const backside = new THREE.Mesh(new THREE.ShapeGeometry(roundedRect(WIDTH - .09, HEIGHT - .09, RADIUS - .04, side), 16), blackGlass);
+      const backShape = side === 'left' ? frameShape(WIDTH - .09, HEIGHT - .09, RADIUS - .04, side) : roundedRect(WIDTH - .09, HEIGHT - .09, RADIUS - .04, side);
+      const backside = new THREE.Mesh(new THREE.ShapeGeometry(backShape, 16), blackGlass);
       backside.rotation.y = Math.PI;
       backside.position.z = -.092;
       group.add(backside);
 
       if (side === 'left') {
-        // Past edge-on, the outside display glides over the stationary half.
-        // It is deliberately soft-focused until the very end of the fold.
-        const cover = new THREE.Mesh(screenGeometry(WIDTH - .18, SCREEN_HEIGHT, SCREEN_RADIUS, 'cover'), this.coverBlurMaterial);
+        // After edge-on the rear of the same hollow glass pane faces the
+        // camera. It samples the stationary wallpaper until the cover display
+        // lights up near the fully closed position.
+        const cover = new THREE.Mesh(screenGeometry(SCREEN_WIDTH, SCREEN_HEIGHT, SCREEN_RADIUS, 'cover'), this.coverGlassMaterial);
         cover.rotation.y = Math.PI;
-        cover.position.z = -.104;
+        cover.position.set(.0525, 0, -.094);
         group.add(cover);
-        const sharp = new THREE.Mesh(screenGeometry(WIDTH - .18, SCREEN_HEIGHT, SCREEN_RADIUS, 'cover'), this.coverSharpMaterial);
-        sharp.rotation.y = Math.PI;
-        sharp.position.z = -.109;
-        group.add(sharp);
-        const reflection = new THREE.Mesh(overlayGeometry(WIDTH - .18, SCREEN_HEIGHT, SCREEN_RADIUS, 'cover'), this.glassReflectionMaterial);
+        const reflection = new THREE.Mesh(overlayGeometry(SCREEN_WIDTH, SCREEN_HEIGHT, SCREEN_RADIUS, 'cover'), this.glassReflectionMaterial);
         reflection.rotation.y = Math.PI;
-        reflection.position.z = -.118;
+        reflection.position.set(.0525, 0, -.098);
         group.add(reflection);
         const sensor = new THREE.Mesh(new THREE.CircleGeometry(.045, 24), blackGlass);
         sensor.rotation.y = Math.PI;
@@ -313,6 +385,7 @@ export class FoldPhone {
       if (side === 'right') {
         const camera = new THREE.Mesh(new THREE.CircleGeometry(.045, 24), blackGlass);
         camera.position.set(-.18, 1.9, .083);
+        this.innerCamera = camera;
         group.add(camera);
         for (const y of [.95, .65]) {
           const button = new THREE.Mesh(new THREE.BoxGeometry(.045, .22, .073), seam);
@@ -375,16 +448,18 @@ export class FoldPhone {
     // then the outside surface travels slowly across the stationary screen.
     const angle = fold * Math.PI;
     this.leftPivot.rotation.y = angle;
-    // Progressive Gaussian defocus reads like imagery viewed through glass,
-    // rather than a second, independently sharp phone screen.
-    this.leftSoftBlurMaterial.opacity = Math.min(1, fold * 2.6);
-    this.leftBlurMaterial.opacity = Math.min(1, Math.max(0, (fold - .12) * 2.7));
+    // Only the turning pane gets defocus and shadow; the wallpaper on the
+    // stationary right display does not fade out as the hinge moves.
+    this.leftImageMaterial.uniforms.fold.value = fold;
     this.glassReflectionMaterial.opacity = Math.min(1, fold * 2.3);
-    this.rightShadeMaterial.opacity = fold * .65;
-    // The screen behind the almost edge-on glass is temporarily obscured.
+    this.rightShadeMaterial.opacity = fold * .12;
     const edgeDistance = (angle - Math.PI / 2) / .43;
-    this.rightVeilMaterial.opacity = .58 * Math.exp(-edgeDistance * edgeDistance);
-    this.coverSharpMaterial.opacity = .8 * Math.pow(Math.max(0, 1 - this.progress / .14), 2);
+    this.rightVeilMaterial.opacity = .10 * Math.exp(-edgeDistance * edgeDistance);
+    // A separate portrait cover image appears only near the closed detent.
+    const coverTransition = THREE.MathUtils.clamp((.16 - this.progress) / .16, 0, 1);
+    this.coverGlassMaterial.uniforms.coverAmount.value = coverTransition * coverTransition * (3 - 2 * coverTransition);
+    // The inner punch-hole is concealed once the outside glass covers it.
+    if (this.innerCamera) this.innerCamera.visible = this.progress > .18;
     this.bridgeMaterial.opacity = Math.min(1, Math.max(0, (this.progress - .95) / .05));
     // Center the actual perspective silhouette, not just its 3D coordinates.
     // Smooth its translation to a stop at 90°, then hold the rear leaf still.
@@ -404,6 +479,8 @@ export class FoldPhone {
       const end = projectedCenter(Math.PI / 2);
       this.model.position.x = (2 * t3 - 3 * t2 + 1) * start + (t3 - 2 * t2 + t) * span * slope + (-2 * t3 + 3 * t2) * end;
     }
+    this.leftImageMaterial.uniforms.wallpaperOffset.value = this.model.position.x;
+    this.coverGlassMaterial.uniforms.wallpaperOffset.value = this.model.position.x;
     this.render();
   }
 
